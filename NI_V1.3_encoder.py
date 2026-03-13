@@ -9,7 +9,7 @@ from datetime import datetime
 from nidaqmx.constants import Edge, Signal, AcquisitionType, LineGrouping, CountDirection, EncoderType, AngleUnits
 
 # --- CONFIGURATION ---
-Mouse_ID             = "A30_PC_GrC_puff_13"
+Mouse_ID             = "A35_PC_GrC_puff_13"
 ARDUINO_LINE         = "Dev1/port0/line3" 
 FRAME_CLOCK_PIN      = "/Dev1/PFI0"
 MICROSCOPE_START_PIN = "Dev1/port0/line2" 
