@@ -4,12 +4,13 @@ import csv
 import sys
 import os
 import math
+import shutil
 from collections import deque
 from datetime import datetime
 from nidaqmx.constants import Edge, Signal, AcquisitionType, LineGrouping, CountDirection, EncoderType, AngleUnits
 
 # --- CONFIGURATION ---
-Mouse_ID             = "A30_PC_GrC_puff_13"
+Mouse_ID             = "A35_puff_104"
 SAVE_DIR             = os.path.expanduser("~/NI_logs")
 
 # USB-6421 routing note (verify exact pinout in NI MAX for your hardware revision):
@@ -30,13 +31,22 @@ SAVE_DIR             = os.path.expanduser("~/NI_logs")
 # Camera lines below are assigned to free terminals to avoid conflicts.
 ARDUINO_LINE         = "Dev1/port0/line3" 
 CAMERA_SYNC_LINE     = "Dev1/port0/line14"  # /Dev1/PFI14 (camera strobe -> NI input)
+CAMERA_SYNC_COUNTER_PIN = "/Dev1/PFI14"
 FRAME_CLOCK_PIN      = "/Dev1/PFI0"
 MICROSCOPE_START_PIN = "Dev1/port0/line2" 
 CAMERA_TRIGGER_PIN   = "Dev1/port0/line15"  # /Dev1/PFI15 (NI trigger -> camera OPTO_IN)
 ARDUINO_TRIG_PIN     = "/Dev1/PFI1"
 MICROSCOPE_PULSE_S   = 0.100
-CAMERA_TRIGGER_S     = 0.010
 CAMERA_SYNC_ACTIVE_EDGE = "falling"          # with pull-up, camera pulse is active-low
+RECORD_DURATION_S    = 5.0                    # Set None to use silence-stop fallback only
+
+
+def set_camera_trigger_level(task: nidaqmx.Task, high: bool):
+    task.write(bool(high))
+
+
+def _edge_from_config(edge_name: str):
+    return Edge.FALLING if str(edge_name).strip().lower() == "falling" else Edge.RISING
 
 # --- ENCODER CONFIGURATION ---
 WHEEL_DIAMETER_CM    = 15.5
@@ -80,7 +90,9 @@ def run_locomotion_logger():
     with nidaqmx.Task() as relay, \
          nidaqmx.Task() as logger_data, \
          nidaqmx.Task() as logger_time, \
-         nidaqmx.Task() as logger_enc:
+         nidaqmx.Task() as logger_enc, \
+            nidaqmx.Task() as logger_camcnt, \
+            nidaqmx.Task() as camera_trigger_task:
         
         # 1. SETUP RELAY
         relay.ai_channels.add_ai_voltage_chan("Dev1/ai0")
@@ -109,6 +121,25 @@ def run_locomotion_logger():
         encoder_channel.ci_encoder_b_input_term = "/Dev1/PFI5"
         logger_enc.timing.cfg_samp_clk_timing(rate=ESTIMATED_FPS, source=FRAME_CLOCK_PIN, active_edge=Edge.FALLING, sample_mode=AcquisitionType.CONTINUOUS)
 
+        # 5. SETUP CAMERA SYNC EDGE COUNTER (robust against frame-clock phase mismatch)
+        use_counter_sync = True
+        try:
+            cam_counter = logger_camcnt.ci_channels.add_ci_count_edges_chan(
+                counter="Dev1/ctr1",
+                edge=_edge_from_config(CAMERA_SYNC_ACTIVE_EDGE),
+                initial_count=0,
+                count_direction=CountDirection.COUNT_UP,
+            )
+            cam_counter.ci_count_edges_term = CAMERA_SYNC_COUNTER_PIN
+        except Exception as exc:
+            use_counter_sync = False
+            print(f"[WARN] Camera sync counter setup failed: {exc}")
+            print("[WARN] Falling back to sampled digital-line edge detection.")
+
+        # 6. SETUP CAMERA TRIGGER GATE OUTPUT (level mode on same pin)
+        camera_trigger_task.do_channels.add_do_chan(CAMERA_TRIGGER_PIN)
+        set_camera_trigger_level(camera_trigger_task, high=False)
+
         with open(full_path, "w", newline='') as f:
             writer = csv.writer(f)
             writer.writerow(["Frame_ID", "Time_s", "Arduino_State", "Camera_Frame", "Raw_Ticks_Signed", "Zeroed_Dist_cm", "Smoothed_Vel_cm_s"]) 
@@ -119,21 +150,18 @@ def run_locomotion_logger():
             logger_enc.start()
             logger_time.start()
             logger_data.start()
+            if use_counter_sync:
+                logger_camcnt.start()
             relay.start()
             
-            print("ACTION: Sending microscope + camera start pulses...")
-            with nidaqmx.Task() as t_scope, nidaqmx.Task() as t_cam:
+            print("ACTION: Sending microscope start pulse and asserting camera trigger HIGH...")
+            with nidaqmx.Task() as t_scope:
                 t_scope.do_channels.add_do_chan(MICROSCOPE_START_PIN)
-                t_cam.do_channels.add_do_chan(CAMERA_TRIGGER_PIN)
                 t_scope.write(False)
-                t_cam.write(False)
                 t_scope.write(True)
-                t_cam.write(True)
-                time.sleep(CAMERA_TRIGGER_S)
-                t_cam.write(False)
-                remaining_scope_time = max(0.0, MICROSCOPE_PULSE_S - CAMERA_TRIGGER_S)
-                if remaining_scope_time > 0:
-                    time.sleep(remaining_scope_time)
+                # Level-trigger camera start on the same line; keep HIGH until acquisition ends.
+                set_camera_trigger_level(camera_trigger_task, high=True)
+                time.sleep(max(0.001, float(MICROSCOPE_PULSE_S)))
                 t_scope.write(False)
 
             print("STATUS: Recording... (Waiting for frames)")
@@ -144,6 +172,7 @@ def run_locomotion_logger():
             last_data_time = time.time()
             start_ticks_time = None 
             start_ticks_enc = None
+            warned_no_camera_sync = False
             
             history_buffer = deque() 
             
@@ -179,33 +208,44 @@ def run_locomotion_logger():
                         chunk_camera_sync = [0] * len(chunk_arduino)
 
                     sample_count = min(len(chunk_arduino), len(chunk_camera_sync), len(chunk_time), len(chunk_enc))
+                    if use_counter_sync:
+                        try:
+                            camera_frame_count = int(logger_camcnt.read())
+                        except Exception:
+                            pass
                     
                     rows = []
+                    stop_due_to_duration = False
                     for i in range(sample_count):
-                        total_frames += 1
-                        
                         curr_ticks_time = chunk_time[i]
-                        state = int(chunk_arduino[i])
-                        camera_sync_state = int(chunk_camera_sync[i])
 
-                        if prev_camera_sync is not None:
-                            if CAMERA_SYNC_ACTIVE_EDGE == "falling":
-                                if prev_camera_sync == 1 and camera_sync_state == 0:
-                                    camera_frame_count += 1
-                            else:
-                                if prev_camera_sync == 0 and camera_sync_state == 1:
-                                    camera_frame_count += 1
-                        prev_camera_sync = camera_sync_state
-                        
-                        # --- FIX 1: Convert to Signed Integer ---
-                        curr_ticks_enc_signed = parse_signed_32bit(chunk_enc[i])
-                        
                         # Zeroing
                         if start_ticks_time is None:
                             start_ticks_time = curr_ticks_time
-                            start_ticks_enc = curr_ticks_enc_signed
+                            start_ticks_enc = parse_signed_32bit(chunk_enc[i])
                         
                         exact_time_s = (curr_ticks_time - start_ticks_time) / TIMEBASE_FREQ
+                        if RECORD_DURATION_S is not None and exact_time_s > float(RECORD_DURATION_S):
+                            stop_due_to_duration = True
+                            break
+
+                        total_frames += 1
+
+                        state = int(chunk_arduino[i])
+                        camera_sync_state = int(chunk_camera_sync[i])
+
+                        if not use_counter_sync:
+                            if prev_camera_sync is not None:
+                                if CAMERA_SYNC_ACTIVE_EDGE == "falling":
+                                    if prev_camera_sync == 1 and camera_sync_state == 0:
+                                        camera_frame_count += 1
+                                else:
+                                    if prev_camera_sync == 0 and camera_sync_state == 1:
+                                        camera_frame_count += 1
+                            prev_camera_sync = camera_sync_state
+                        
+                        # --- FIX 1: Convert to Signed Integer ---
+                        curr_ticks_enc_signed = parse_signed_32bit(chunk_enc[i])
                         
                         # Correct distance calculation using signed math
                         current_dist_cm = (curr_ticks_enc_signed - start_ticks_enc) * CM_PER_TICK
@@ -235,28 +275,43 @@ def run_locomotion_logger():
                         ])
                     
                     writer.writerows(rows)
+
+                    if not rows:
+                        if stop_due_to_duration:
+                            print(f"\n[STOP] Duration reached ({RECORD_DURATION_S:.3f}s). Saving...")
+                            break
+                        continue
                     
-                    # --- FIX 2: Pad Output string to clear artifacts ---
-                    frame_delta = total_frames - camera_frame_count
-                    cam_detect = "YES" if camera_frame_count > 0 else "NO"
+                    term_cols = shutil.get_terminal_size(fallback=(120, 20)).columns
                     status_str = (
                         f"\rScopeFr: {total_frames} | CamFr: {rows[-1][3]} | "
-                        f"Delta: {frame_delta} | CamDetected: {cam_detect} | "
                         f"T: {rows[-1][1]}s | Pos: {rows[-1][5]}cm | Vel: {rows[-1][6]}cm/s"
                     )
-                    # Add 20 spaces of padding to wipe out old text, then flush
-                    sys.stdout.write(status_str.ljust(80)) 
+                    # Clip and pad to terminal width to avoid wrapping artifacts and stale chars.
+                    max_line = max(20, term_cols - 1)
+                    sys.stdout.write(status_str[:max_line].ljust(max_line))
                     sys.stdout.flush()
+
+                    if (not warned_no_camera_sync) and total_frames >= 500 and camera_frame_count == 0:
+                        warned_no_camera_sync = True
+                        print("\n[WARN] No camera sync edges detected on CAMERA_SYNC_LINE.")
+                        print("[WARN] Check camera sync output line mapping (camera LineX -> NI PFI14), edge polarity, and pulse width.")
+
+                    if stop_due_to_duration:
+                        print(f"\n[STOP] Duration reached ({RECORD_DURATION_S:.3f}s). Saving...")
+                        break
                     
                     time.sleep(0.01)
                     
             except KeyboardInterrupt:
                 print("\nStopped.")
 
+            print("\nACTION: Deasserting camera trigger (LOW) on same line...")
+            set_camera_trigger_level(camera_trigger_task, high=False)
+
     print(f"\n\n--- DONE ---")
     print(f"Microscope Frames:      {total_frames}")
     print(f"Camera Frames Detected: {camera_frame_count}")
-    print(f"Frame Delta (Scope-Cam): {total_frames - camera_frame_count}")
     print(f"File Saved:   {full_path}")
 
 if __name__ == "__main__":
