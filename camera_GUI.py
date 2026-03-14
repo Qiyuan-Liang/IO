@@ -22,8 +22,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -853,6 +851,7 @@ class HikMVSCameraBackend(CameraBackend):
         self._safe_set_bool("StrobeEnable", True)
 
         source_map = {
+            "Start of exposure": ["ExposureStart", "FrameStart"],
             "Start of frame": ["FrameStart", "ExposureStart"],
             "End of frame": ["FrameEnd", "ExposureEnd"],
             "Exposure": ["ExposureActive", "ExposureStart"],
@@ -940,6 +939,7 @@ class CameraWorker(QObject):
         self._cam_image_node_num = 32
         self._cam_output_queue_size = 8
         self._last_stats_emit_ts = 0.0
+        self._output_resolution = None  # (w, h) target for full-frame downsampling
         self._roi_rect = None  # (x, y, w, h) in raw-frame pixels
         self._last_res_report = None
 
@@ -993,6 +993,20 @@ class CameraWorker(QObject):
         canvas[off_y : off_y + fit_h, off_x : off_x + fit_w] = resized
         return canvas, (x, y, w, h)
 
+    def _apply_output_downsample(self, frame: np.ndarray) -> np.ndarray:
+        with self._lock:
+            target = self._output_resolution
+        if target is None:
+            return frame
+        target_w, target_h = int(target[0]), int(target[1])
+        src_h, src_w = frame.shape[:2]
+        if target_w <= 0 or target_h <= 0:
+            return frame
+        # Never upscale; only downsample whole frame to avoid sensor top-left cropping behavior.
+        if target_w >= src_w or target_h >= src_h:
+            return frame
+        return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
     def _emit_resolution_report(self, raw_frame: np.ndarray, out_frame: np.ndarray, roi_rect: Optional[Tuple[int, int, int, int]]):
         raw_h, raw_w = raw_frame.shape[:2]
         out_h, out_w = out_frame.shape[:2]
@@ -1040,20 +1054,17 @@ class CameraWorker(QObject):
         self.connected.emit(False)
         self.status.emit("Camera disconnected")
 
-    def apply_settings(self, exposure_us: float, fps: float, gain: float, throughput_bps: int, resolution: Tuple[int, int]):
+    def apply_settings(self, exposure_us: float, fps: float, gain: float, resolution: Tuple[int, int]):
         if self.backend is None:
             return
         self.backend.set_exposure_us(exposure_us)
         self.backend.set_frame_rate(fps)
         self.backend.set_gain(gain)
-        self.backend.set_throughput_limit(throughput_bps)
-        self.backend.set_resolution(resolution[0], resolution[1])
+        with self._lock:
+            self._output_resolution = (int(resolution[0]), int(resolution[1]))
         self.status.emit(
-            f"Applied: Exp={exposure_us:.1f}us, FPS={fps:.2f}, Gain={gain:.2f}, Throughput={throughput_bps}, Res={resolution[0]}x{resolution[1]}"
+            f"Applied: Exp={exposure_us:.1f}us, FPS={fps:.2f}, Gain={gain:.2f}, Res={resolution[0]}x{resolution[1]}"
         )
-        tput_status = self.backend.get_throughput_status()
-        if tput_status:
-            self.status.emit(tput_status)
 
     def set_frame_rate_only(self, fps: float):
         if self.backend is None:
@@ -1073,20 +1084,9 @@ class CameraWorker(QObject):
         self.backend.set_gain(gain)
         self.status.emit(f"Applied gain: {gain:.2f}")
 
-    def set_throughput_only(self, throughput_bps: int):
-        if self.backend is None:
-            return
-        self.backend.set_throughput_limit(int(throughput_bps))
-        tput_status = self.backend.get_throughput_status()
-        if tput_status:
-            self.status.emit(tput_status)
-        else:
-            self.status.emit(f"Applied throughput limit: {throughput_bps}")
-
     def set_resolution_only(self, width: int, height: int):
-        if self.backend is None:
-            return
-        self.backend.set_resolution(int(width), int(height))
+        with self._lock:
+            self._output_resolution = (int(width), int(height))
         self.status.emit(f"Applied resolution: {int(width)}x{int(height)}")
 
     def apply_sync_output(self, enabled: bool, source_mode: str, pulse_duration_us: float, output_line: str):
@@ -1349,7 +1349,8 @@ class CameraWorker(QObject):
                 continue
 
             raw_frame = packet.frame
-            frame, roi_rect = self._apply_roi_zoom(raw_frame)
+            scaled_frame = self._apply_output_downsample(raw_frame)
+            frame, roi_rect = self._apply_roi_zoom(scaled_frame)
             self._emit_resolution_report(raw_frame, frame, roi_rect)
 
             if packet.frame_id is not None and self._last_frame_id is not None and self._last_frame_ts is not None:
@@ -1537,7 +1538,7 @@ class CameraGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HKrobot Camera GUI")
-        self.resize(1220, 820)
+        self.resize(1000, 600)
 
         self.worker = CameraWorker()
         self.worker_thread = QThread()
@@ -1573,59 +1574,42 @@ class CameraGUI(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        # Top quick bar
-        top = QGridLayout()
-        self.backend_label = QLabel("Backend: -")
+        # Unified top control bar.
+        top = QHBoxLayout()
+        self.backend_label = QLabel("Source: -")
         self.device_combo = QComboBox()
         self.refresh_btn = QPushButton("Refresh")
-        self.connect_btn = QPushButton("Connect")
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.setEnabled(False)
-        self.check_btn = QPushButton("Connection check")
-
-        top.addWidget(self.backend_label, 0, 0)
-        top.addWidget(QLabel("Camera"), 0, 1)
-        top.addWidget(self.device_combo, 0, 2)
-        top.addWidget(self.refresh_btn, 0, 3)
-        top.addWidget(self.connect_btn, 0, 4)
-        top.addWidget(self.disconnect_btn, 0, 5)
-        top.addWidget(self.check_btn, 0, 6)
-        layout.addLayout(top)
-
-        # Run controls at top (outside tabs).
-        run_row = QHBoxLayout()
         self.live_start_btn = QPushButton("Start live")
         self.live_stop_btn = QPushButton("Stop live")
-        self.live_stop_btn.setEnabled(False)
+        self.live_stop_btn.hide()
         self.snapshot_btn = QPushButton("Snapshot")
+        self.snapshot_btn.setEnabled(False)
         self.acq_start_btn = QPushButton("Start acquisition")
         self.acq_stop_btn = QPushButton("Stop acquisition")
-        self.acq_stop_btn.setEnabled(False)
+        self.acq_stop_btn.hide()
         self.rec_indicator_btn = QPushButton("")
         self.rec_indicator_btn.setEnabled(False)
         self.rec_indicator_btn.setFixedSize(18, 18)
         self.rec_indicator_btn.setToolTip("Recording indicator")
-        self.cam_buf_label = QLabel("CamBuf: n32/q8")
-        self.sw_buf_label = QLabel("SWBuf: 0/0")
-        self.fps_label = QLabel("Camera FPS: --")
 
-        run_row.addWidget(self.live_start_btn)
-        run_row.addWidget(self.live_stop_btn)
-        run_row.addWidget(self.snapshot_btn)
-        run_row.addWidget(self.acq_start_btn)
-        run_row.addWidget(self.acq_stop_btn)
-        run_row.addWidget(self.rec_indicator_btn)
-        run_row.addStretch(1)
-        run_row.addWidget(self.cam_buf_label)
-        run_row.addWidget(self.sw_buf_label)
-        run_row.addWidget(self.fps_label)
-        layout.addLayout(run_row)
+        top.addWidget(self.backend_label)
+        top.addWidget(QLabel("Camera"))
+        top.addWidget(self.device_combo, 1)
+        top.addWidget(self.refresh_btn)
+        top.addSpacing(8)
+        top.addWidget(self.live_start_btn)
+        top.addWidget(self.live_stop_btn)
+        top.addWidget(self.snapshot_btn)
+        top.addWidget(self.acq_start_btn)
+        top.addWidget(self.acq_stop_btn)
+        top.addWidget(self.rec_indicator_btn)
+        layout.addLayout(top)
         self._set_record_indicator_idle()
 
         # Left panel as tabs to save space.
         self.left_tabs = QTabWidget()
-        self.left_tabs.setMinimumWidth(390)
-        self.left_tabs.setMaximumWidth(460)
+        self.left_tabs.setMinimumWidth(292)
+        self.left_tabs.setMaximumWidth(345)
 
         # Camera tab
         camera_tab = QWidget()
@@ -1645,11 +1629,14 @@ class CameraGUI(QMainWindow):
         self.gain_spin.setRange(0.0, 30.0)
         self.gain_spin.setDecimals(2)
         self.gain_spin.setValue(0.0)
-        self.gain_range_label = QLabel("Gain range: unknown")
-
-        self.throughput_spin = QSpinBox()
-        self.throughput_spin.setRange(1_000_000, 500_000_000)
-        self.throughput_spin.setValue(120_000_000)
+        self.gain_range_label = QLabel("Max: -- dB")
+        gain_row = QHBoxLayout()
+        gain_row.setContentsMargins(0, 0, 0, 0)
+        gain_row.addWidget(self.gain_spin)
+        gain_row.addWidget(self.gain_range_label)
+        gain_row.addStretch(1)
+        gain_wrap = QWidget()
+        gain_wrap.setLayout(gain_row)
 
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItems([
@@ -1662,17 +1649,19 @@ class CameraGUI(QMainWindow):
         self.roi_select_btn = QPushButton("Select ROI")
         self.roi_select_btn.setCheckable(True)
         self.roi_clear_btn = QPushButton("Clear ROI")
-        self.roi_hint_label = QLabel("Click 'Select ROI', draw once on preview")
+        roi_row = QHBoxLayout()
+        roi_row.setContentsMargins(0, 0, 0, 0)
+        roi_row.addWidget(self.roi_select_btn)
+        roi_row.addWidget(self.roi_clear_btn)
+        roi_wrap = QWidget()
+        roi_wrap.setLayout(roi_row)
+
 
         camera_form.addRow("Exposure (us)", self.exposure_spin)
         camera_form.addRow("Frame rate (Hz)", self.fps_spin)
-        camera_form.addRow("Gain", self.gain_spin)
-        camera_form.addRow("Gain limits", self.gain_range_label)
-        camera_form.addRow("DeviceLinkThroughputLimit", self.throughput_spin)
+        camera_form.addRow("Gain", gain_wrap)
         camera_form.addRow("Resolution", self.resolution_combo)
-        camera_form.addRow("ROI", self.roi_hint_label)
-        camera_form.addRow("", self.roi_select_btn)
-        camera_form.addRow("", self.roi_clear_btn)
+        camera_form.addRow("ROI", roi_wrap)
 
         # Save tab
         save_tab = QWidget()
@@ -1696,14 +1685,21 @@ class CameraGUI(QMainWindow):
         self.queue_size_spin = QSpinBox()
         self.queue_size_spin.setRange(8, 8192)
         self.queue_size_spin.setValue(512)
+        queue_row = QHBoxLayout()
+        queue_row.setContentsMargins(0, 0, 0, 0)
+        queue_row.addWidget(self.queue_size_spin)
+        queue_row.addWidget(QLabel("frames"))
+        queue_row.addStretch(1)
+        queue_wrap = QWidget()
+        queue_wrap.setLayout(queue_row)
 
-        self.drop_frames_check = QCheckBox("Drop frames if writer queue is full (keeps real-time capture)")
+        self.drop_frames_check = QCheckBox("Drop frames if writer queue is full")
         self.drop_frames_check.setChecked(True)
 
         save_form.addRow("Folder", folder_wrap)
         save_form.addRow("Base name", self.base_name_edit)
-        save_form.addRow("Recording profile", self.codec_profile_combo)
-        save_form.addRow("Disk writer queue (frames)", self.queue_size_spin)
+        save_form.addRow("Format", self.codec_profile_combo)
+        save_form.addRow("Buffer", queue_wrap)
         save_form.addRow("", self.drop_frames_check)
 
         # Hardware trigger/sync tab
@@ -1713,16 +1709,16 @@ class CameraGUI(QMainWindow):
         self.trigger_input_line_combo.addItems(["Line0", "Line1", "Line2", "Line3"])
         self.trigger_input_line_combo.setCurrentText("Line0")
 
-        self.trigger_enable_check = QCheckBox("Enable level trigger (HIGH=start, LOW=stop)")
+        self.trigger_enable_check = QCheckBox("Enable level trigger")
         self.trigger_enable_check.setChecked(False)
-        self.auto_start_check = QCheckBox("Auto-start clips while trigger is HIGH")
+        self.auto_start_check = QCheckBox("Auto-start with level trigger")
         self.auto_start_check.setChecked(False)
 
-        self.sync_enable_check = QCheckBox("Enable sync/strobe output")
+        self.sync_enable_check = QCheckBox("Enable sync/strobe")
         self.sync_enable_check.setChecked(True)
         self.sync_mode_combo = QComboBox()
-        self.sync_mode_combo.addItems(["Start of frame", "End of frame", "Exposure"])
-        self.sync_mode_combo.setCurrentText("Exposure")
+        self.sync_mode_combo.addItems(["Start of exposure", "Start of frame", "End of frame", "Exposure"])
+        self.sync_mode_combo.setCurrentText("Start of exposure")
         self.sync_output_line_combo = QComboBox()
         self.sync_output_line_combo.addItems(["Line1", "Line2", "Line3"])
         self.sync_output_line_combo.setCurrentText("Line2")
@@ -1731,16 +1727,13 @@ class CameraGUI(QMainWindow):
         self.sync_pulse_us_spin.setDecimals(1)
         self.sync_pulse_us_spin.setValue(1000.0)
 
-        self.test_pulse_btn = QPushButton("Apply trigger/sync settings")
-
-        ni_form.addRow("Camera trigger source", self.trigger_input_line_combo)
+        ni_form.addRow("Trigger line", self.trigger_input_line_combo)
         ni_form.addRow("", self.trigger_enable_check)
         ni_form.addRow("", self.auto_start_check)
         ni_form.addRow("", self.sync_enable_check)
         ni_form.addRow("Sync output line", self.sync_output_line_combo)
         ni_form.addRow("Sync source", self.sync_mode_combo)
-        ni_form.addRow("Sync pulse duration (us)", self.sync_pulse_us_spin)
-        ni_form.addRow("", self.test_pulse_btn)
+        ni_form.addRow("Pulse width (us)", self.sync_pulse_us_spin)
 
         self.grab_strategy_combo = QComboBox()
         self.grab_strategy_combo.addItems([
@@ -1759,15 +1752,27 @@ class CameraGUI(QMainWindow):
         self.output_queue_spin.setRange(1, 128)
         self.output_queue_spin.setValue(8)
 
-        self.apply_buffer_btn = QPushButton("Apply buffer settings")
         camera_form.addRow("Grab strategy", self.grab_strategy_combo)
         camera_form.addRow("ImageNodeNum", self.image_node_spin)
         camera_form.addRow("OutputQueueSize", self.output_queue_spin)
-        camera_form.addRow("", self.apply_buffer_btn)
 
         self.left_tabs.addTab(camera_tab, "Camera")
         self.left_tabs.addTab(save_tab, "Save")
-        self.left_tabs.addTab(ni_tab, "Trigger/Sync")
+        self.left_tabs.addTab(ni_tab, "I/O")
+
+        self.sw_buf_label = QLabel("Buffer: 0/0")
+        self.fps_label = QLabel("Camera FPS: --")
+        left_bottom_row = QHBoxLayout()
+        left_bottom_row.setContentsMargins(0, 4, 0, 0)
+        left_bottom_row.addWidget(self.sw_buf_label)
+        left_bottom_row.addStretch(1)
+        left_bottom_row.addWidget(self.fps_label)
+
+        left_panel = QVBoxLayout()
+        left_panel.addWidget(self.left_tabs)
+        left_panel.addLayout(left_bottom_row)
+        left_wrap = QWidget()
+        left_wrap.setLayout(left_panel)
 
         # Preview area
         self.preview_label = PreviewLabel("No frame")
@@ -1776,7 +1781,7 @@ class CameraGUI(QMainWindow):
         self.preview_label.setMinimumSize(740, 560)
 
         body = QHBoxLayout()
-        body.addWidget(self.left_tabs)
+        body.addWidget(left_wrap)
         body.addWidget(self.preview_label, 1)
         layout.addLayout(body)
 
@@ -1786,19 +1791,17 @@ class CameraGUI(QMainWindow):
         layout.addWidget(self.status_box)
 
     def _bind_signals(self):
-        self.refresh_btn.clicked.connect(self.refresh_devices)
-        self.connect_btn.clicked.connect(self.on_connect)
-        self.disconnect_btn.clicked.connect(self.on_disconnect)
-        self.check_btn.clicked.connect(self.on_connection_check)
+        self.refresh_btn.clicked.connect(self.on_refresh_cycle)
 
-        self.apply_buffer_btn.clicked.connect(self.apply_buffer_settings)
         self.roi_select_btn.toggled.connect(self.on_roi_select_toggled)
         self.roi_clear_btn.clicked.connect(self.clear_roi)
         self.exposure_spin.valueChanged.connect(self._apply_exposure_live)
         self.gain_spin.valueChanged.connect(self._apply_gain_live)
         self.fps_spin.valueChanged.connect(self._apply_frame_rate_live)
-        self.throughput_spin.valueChanged.connect(self._apply_throughput_live)
         self.resolution_combo.currentTextChanged.connect(lambda _text: self._apply_resolution_live())
+        self.grab_strategy_combo.currentIndexChanged.connect(lambda _idx: self.apply_buffer_settings())
+        self.image_node_spin.valueChanged.connect(lambda _v: self.apply_buffer_settings())
+        self.output_queue_spin.valueChanged.connect(lambda _v: self.apply_buffer_settings())
 
         self.live_start_btn.clicked.connect(self.start_live)
         self.live_stop_btn.clicked.connect(self.stop_live)
@@ -1807,11 +1810,10 @@ class CameraGUI(QMainWindow):
         self.acq_stop_btn.clicked.connect(self.stop_acquisition)
 
         self.save_browse_btn.clicked.connect(self.on_browse_folder)
-        self.test_pulse_btn.clicked.connect(self.send_test_pulse)
-        self.trigger_enable_check.toggled.connect(lambda _v: self.log("Trigger config updated (applies on next acquisition)."))
-        self.trigger_input_line_combo.currentTextChanged.connect(lambda _text: self.log("Trigger source updated (applies on next acquisition)."))
+        self.trigger_enable_check.toggled.connect(lambda _v: self.apply_trigger_settings())
+        self.trigger_input_line_combo.currentTextChanged.connect(lambda _text: self.apply_trigger_settings())
         self.auto_start_check.toggled.connect(self.on_auto_start_toggled)
-        self.sync_enable_check.toggled.connect(self.apply_sync_settings)
+        self.sync_enable_check.toggled.connect(lambda _v: self.apply_sync_settings())
         self.sync_output_line_combo.currentTextChanged.connect(lambda _text: self.apply_sync_settings())
         self.sync_mode_combo.currentTextChanged.connect(lambda _text: self.apply_sync_settings())
         self.sync_pulse_us_spin.valueChanged.connect(lambda _val: self.apply_sync_settings())
@@ -1850,22 +1852,43 @@ class CameraGUI(QMainWindow):
         self._record_indicator_on = not self._record_indicator_on
         self._set_record_indicator_flash(self._record_indicator_on)
 
+    def _set_live_controls(self, live_running: bool):
+        self.live_start_btn.setVisible(not live_running)
+        self.live_stop_btn.setVisible(live_running)
+
+    def _set_acq_controls(self, acquisition_running: bool):
+        self.acq_start_btn.setVisible(not acquisition_running)
+        self.acq_stop_btn.setVisible(acquisition_running)
+
     def _init_backend(self):
         hik_backend = HikMVSCameraBackend()
         if hik_backend.is_available():
             self._backend_obj = hik_backend
             self.worker.set_backend(hik_backend)
-            self.backend_label.setText("Backend: HikMVS")
+            self.backend_label.setText("Source: HikMVS")
             self.log("HikMVS initialized from official MVS Python API path")
         else:
             self._backend_obj = OpenCVCameraBackend()
             self.worker.set_backend(self._backend_obj)
-            self.backend_label.setText("Backend: OpenCV fallback")
+            self.backend_label.setText("Source: OpenCV fallback")
             err = hik_backend.get_init_error().strip()
             if err:
                 self.log(f"HikMVS unavailable: {err}")
             self.log("Fallback to OpenCV camera backend")
         self.refresh_devices()
+
+    def on_refresh_cycle(self):
+        if self._connected:
+            self.on_disconnect()
+        self.refresh_devices()
+        if self.device_combo.count() <= 0:
+            self.log("Refresh cycle: no camera found")
+            return
+        self.on_connect()
+        if self._connected:
+            self.log("Refresh cycle: connection check passed")
+        else:
+            self.log("Refresh cycle: connection check failed")
 
     def log(self, message: str):
         t = datetime.now().strftime("%H:%M:%S")
@@ -1910,12 +1933,10 @@ class CameraGUI(QMainWindow):
         if enabled:
             self.trigger_enable_check.setChecked(True)
             self.trigger_enable_check.setEnabled(False)
-            self.acq_start_btn.setEnabled(False)
-            self.acq_stop_btn.setEnabled(True)
+            self._set_acq_controls(True)
         else:
             self.trigger_enable_check.setEnabled(True)
-            self.acq_start_btn.setEnabled(True)
-            self.acq_stop_btn.setEnabled(False)
+            self._set_acq_controls(False)
 
         if not self._connected:
             self.log("Auto-start preference saved; connect camera to apply")
@@ -1926,8 +1947,7 @@ class CameraGUI(QMainWindow):
             self.apply_trigger_settings(enable_override=bool(enabled) or self.trigger_enable_check.isChecked())
             if enabled:
                 self.worker.start_live()
-                self.live_start_btn.setEnabled(False)
-                self.live_stop_btn.setEnabled(True)
+                self._set_live_controls(True)
                 self.log("Auto-start enabled: camera will record whenever trigger stays HIGH")
             else:
                 self.log("Auto-start disabled")
@@ -1959,13 +1979,6 @@ class CameraGUI(QMainWindow):
         except Exception as exc:
             self.log(f"ERROR: Disconnect failed: {exc}")
 
-    def on_connection_check(self):
-        self.refresh_devices()
-        if self.device_combo.count() > 0:
-            self.log("Connection check passed")
-        else:
-            self.log("Connection check failed")
-
     def apply_settings(self):
         if not self._connected:
             self.log("Settings cached; connect camera to apply")
@@ -1976,11 +1989,10 @@ class CameraGUI(QMainWindow):
                 exposure_us=float(self.exposure_spin.value()),
                 fps=float(self.fps_spin.value()),
                 gain=float(self.gain_spin.value()),
-                throughput_bps=int(self.throughput_spin.value()),
                 resolution=(sel_w, sel_h),
             )
             self.worker.set_preview_target_fps(float(self.fps_spin.value()))
-            self.log(f"Selected raw resolution: {sel_w}x{sel_h} (ROI zoom is applied within this frame)")
+            self.log(f"Selected output resolution: {sel_w}x{sel_h} (whole-frame downsample)")
         except Exception as exc:
             self.log(f"ERROR: Apply settings failed: {exc}")
 
@@ -2116,14 +2128,6 @@ class CameraGUI(QMainWindow):
         except Exception as exc:
             self.log(f"ERROR: Gain live update failed: {exc}")
 
-    def _apply_throughput_live(self, value: int):
-        if not self._connected:
-            return
-        try:
-            self.worker.set_throughput_only(int(value))
-        except Exception as exc:
-            self.log(f"ERROR: Throughput live update failed: {exc}")
-
     def _apply_resolution_live(self):
         if not self._connected:
             return
@@ -2140,14 +2144,12 @@ class CameraGUI(QMainWindow):
         # Live should run in free-run mode unless acquisition explicitly arms trigger mode.
         self.apply_trigger_settings(enable_override=False)
         self.worker.start_live()
-        self.live_start_btn.setEnabled(False)
-        self.live_stop_btn.setEnabled(True)
+        self._set_live_controls(True)
         self.log("Live mode started")
 
     def stop_live(self):
         self.worker.stop_live()
-        self.live_start_btn.setEnabled(True)
-        self.live_stop_btn.setEnabled(False)
+        self._set_live_controls(False)
         self.log("Live mode stopped")
 
     def on_snapshot(self):
@@ -2182,8 +2184,8 @@ class CameraGUI(QMainWindow):
         if self.auto_start_check.isChecked():
             self.log("Auto-start is enabled; acquisition will be controlled by trigger level automatically")
             self.worker.start_live()
-            self.live_start_btn.setEnabled(False)
-            self.live_stop_btn.setEnabled(True)
+            self._set_live_controls(True)
+            self._set_acq_controls(True)
             return
 
         self.apply_trigger_settings(enable_override=self.trigger_enable_check.isChecked())
@@ -2195,10 +2197,8 @@ class CameraGUI(QMainWindow):
             auto_start=False,
         )
         self.worker.start_live()
-        self.acq_start_btn.setEnabled(False)
-        self.acq_stop_btn.setEnabled(True)
-        self.live_start_btn.setEnabled(False)
-        self.live_stop_btn.setEnabled(False)
+        self._set_acq_controls(True)
+        self._set_live_controls(True)
         if self.trigger_enable_check.isChecked():
             self.log("Acquisition armed, waiting for trigger HIGH (will stop on LOW)")
         else:
@@ -2212,19 +2212,9 @@ class CameraGUI(QMainWindow):
             self.auto_start_check.blockSignals(False)
         self.worker.stop_recording(send_end_pulse=True)
         self.apply_trigger_settings(enable_override=False)
-        self.acq_start_btn.setEnabled(True)
-        self.acq_stop_btn.setEnabled(False)
-        self.live_start_btn.setEnabled(True)
-        self.live_stop_btn.setEnabled(True)
+        self._set_acq_controls(False)
+        self._set_live_controls(False)
         self.log("Acquisition stopped")
-
-    def send_test_pulse(self):
-        try:
-            self.apply_trigger_settings()
-            self.apply_sync_settings()
-            self.log("Applied camera trigger/sync settings")
-        except Exception as exc:
-            self.log(f"ERROR: Apply trigger/sync settings failed: {exc}")
 
     def on_browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select output folder", self.save_folder_edit.text().strip() or os.getcwd())
@@ -2233,8 +2223,9 @@ class CameraGUI(QMainWindow):
 
     def on_connected_state(self, is_connected: bool):
         self._connected = is_connected
-        self.connect_btn.setEnabled(not is_connected)
-        self.disconnect_btn.setEnabled(is_connected)
+        self.snapshot_btn.setEnabled(is_connected)
+        self._set_live_controls(False)
+        self._set_acq_controls(False)
         if not is_connected:
             self.fps_label.setText("Camera FPS: --")
             self._is_recording_now = False
@@ -2247,7 +2238,7 @@ class CameraGUI(QMainWindow):
             g_min, g_max, g_cur = gain_range
             self.gain_spin.setRange(float(g_min), float(g_max))
             self.gain_spin.setValue(float(g_cur))
-            self.gain_range_label.setText(f"{g_min:.3f} .. {g_max:.3f}")
+            self.gain_range_label.setText(f"Max: {g_max:.2f} dB")
             self.log(f"Gain range: {g_min:.3f} to {g_max:.3f}")
 
         res_range = payload.get("res_range")
@@ -2266,22 +2257,17 @@ class CameraGUI(QMainWindow):
             self._set_record_indicator_idle()
 
         if not is_recording:
-            self.acq_start_btn.setEnabled(True)
-            self.acq_stop_btn.setEnabled(False)
-            self.live_start_btn.setEnabled(True)
-            self.live_stop_btn.setEnabled(True)
+            if not self.auto_start_check.isChecked():
+                self._set_acq_controls(False)
 
     def on_camera_fps(self, fps_value: float):
         self.fps_label.setText(f"Camera FPS: {fps_value:.1f}")
 
     def on_buffer_stats(self, stats: dict):
-        cam_node = int(stats.get("cam_node", 0))
-        cam_outq = int(stats.get("cam_outq", 0))
         sw_used = int(stats.get("sw_used", 0))
         sw_max = int(stats.get("sw_max", 0))
         drops = int(stats.get("drops", 0))
-        self.cam_buf_label.setText(f"CamBuf cfg: n{cam_node}/q{cam_outq}")
-        self.sw_buf_label.setText(f"SWBuf: {sw_used}/{sw_max} drop:{drops}")
+        self.sw_buf_label.setText(f"Buffer: {sw_used}/{sw_max} drop:{drops}")
         fill = (float(sw_used) / float(sw_max)) if sw_max > 0 else 0.0
         if fill >= 0.9:
             self.sw_buf_label.setStyleSheet("color:#ff5a5a;")
