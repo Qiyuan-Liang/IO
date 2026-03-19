@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python _test_imports\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^exec zsh$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

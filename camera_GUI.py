@@ -831,37 +831,64 @@ class HikMVSCameraBackend(CameraBackend):
         self._cam.MV_CC_SetGrabStrategy(strategy)
         self._cam.MV_CC_SetOutputQueueSize(queue_size)
 
-    def configure_sync_output(self, enabled: bool, source_mode: str, pulse_duration_us: float, output_line: str):
-        if self._cam is None:
-            return
+    def configure_sync_output(self, enabled: bool, source_mode: str, pulse_duration_us: float, output_line: str) -> Optional[str]:
+        """Configure strobe/sync pulse output matching MVS software flow.
 
-        line_name = (output_line or "Line2").strip()
-        self._safe_set_enum_str("LineSelector", line_name)
+        Stops grabbing before configuring, then restarts — many Hikrobot USB3
+        cameras only latch strobe registers on stream start.
+        MVS order: LineSelector -> LineSource -> StrobeDuration -> StrobeEnable.
+        """
+        if self._cam is None:
+            return None
+
+        # Stop grabbing so register writes take effect on next start.
+        was_grabbing = self._is_grabbing
+        if was_grabbing:
+            self.stop_grabbing()
+
+        try:
+            return self._apply_strobe_registers(enabled, source_mode, pulse_duration_us, output_line)
+        finally:
+            if was_grabbing:
+                self.start_grabbing()
+
+    def _apply_strobe_registers(self, enabled: bool, source_mode: str, pulse_duration_us: float, output_line: str) -> Optional[str]:
+        line_name = (output_line or "Line1").strip()
+        if not self._safe_set_enum_str("LineSelector", line_name):
+            raise RuntimeError(f"Sync output failed: unsupported LineSelector '{line_name}'")
 
         if not enabled:
-            # Force-disable output path to avoid residual pulses when unchecked.
             self._safe_set_bool("StrobeEnable", False)
             self._safe_set_enum_str("LineSource", "Off")
-            self._safe_set_enum_str("LineSource", "UserOutput0")
-            self._safe_set_enum_str("LineMode", "Input")
-            return
+            return "disabled"
 
-        # Best-effort mapping for Hik line-based strobe output.
-        self._safe_set_enum_str("LineMode", "Output")
-        self._safe_set_bool("StrobeEnable", True)
+        # Try Strobe line mode (some models need it; others ignore it).
+        self._safe_set_enum_str("LineMode", "Strobe")
 
+        # --- LineSource ---
+        # GenICam strings vary across firmware; try every plausible alias.
         source_map = {
-            "Start of exposure": ["ExposureStart", "FrameStart"],
-            "Start of frame": ["FrameStart", "ExposureStart"],
-            "End of frame": ["FrameEnd", "ExposureEnd"],
-            "Exposure": ["ExposureActive", "ExposureStart"],
+            "Start of exposure": ["ExposureStartActive", "ExposureStart", "FrameStartActive", "FrameActive", "FrameStart"],
+            "Start of frame":   ["FrameStartActive", "FrameActive", "FrameStart", "ExposureStartActive", "ExposureStart"],
+            "Frame start active": ["FrameStartActive", "FrameActive", "FrameBurstStartActive", "FrameStart", "ExposureStartActive"],
+            "End of frame":     ["FrameEnd", "ExposureEnd"],
+            "Exposure":         ["ExposureActive", "ExposureStartActive", "ExposureStart"],
         }
-        candidates = source_map.get(source_mode, ["FrameStart"])
+        candidates = source_map.get(source_mode, ["FrameStartActive", "FrameActive", "FrameStart"])
+        applied_token = None
         for token in candidates:
             if self._safe_set_enum_str("LineSource", token):
-                # Best-effort pulse width control for strobe output.
-                self._safe_set_float("StrobeDuration", float(max(1.0, pulse_duration_us)))
-                return
+                applied_token = token
+                break
+        if applied_token is None:
+            raise RuntimeError(
+                f"Sync output failed: no supported LineSource for mode '{source_mode}' on {line_name}"
+            )
+
+        # --- StrobeDuration -> StrobeEnable (MVS order) ---
+        self._safe_set_float("StrobeDuration", float(max(1.0, pulse_duration_us)))
+        self._safe_set_bool("StrobeEnable", True)
+        return f"{line_name}:{applied_token}"
 
     def configure_record_trigger(self, enabled: bool, source_line: str):
         if self._cam is None:
@@ -941,7 +968,10 @@ class CameraWorker(QObject):
         self._last_stats_emit_ts = 0.0
         self._output_resolution = None  # (w, h) target for full-frame downsampling
         self._roi_rect = None  # (x, y, w, h) in raw-frame pixels
+        self._trigger_poll_interval_s = 0.010  # poll trigger level at most every 10ms
+        self._last_trigger_poll_ts = 0.0
         self._last_res_report = None
+        self._shared_frame_counter = None
 
     def set_backend(self, backend: CameraBackend):
         self.backend = backend
@@ -1092,17 +1122,20 @@ class CameraWorker(QObject):
     def apply_sync_output(self, enabled: bool, source_mode: str, pulse_duration_us: float, output_line: str):
         if self.backend is None:
             return
-        self.backend.configure_sync_output(enabled, source_mode, pulse_duration_us, output_line)
-        self.status.emit(
-            f"Sync output: enabled={enabled}, line={output_line}, mode={source_mode}, pulse={pulse_duration_us:.1f}us"
-        )
+        applied_source = self.backend.configure_sync_output(enabled, source_mode, pulse_duration_us, output_line)
+        source_text = applied_source if applied_source is not None else "n/a"
+        msg = f"Sync output: enabled={enabled}, line={output_line}, mode={source_mode}, applied_source={source_text}, pulse={pulse_duration_us:.1f}us"
+        if msg != getattr(self, '_last_sync_log', None):
+            self._last_sync_log = msg
+            self.status.emit(msg)
 
-    def apply_record_trigger(self, enabled: bool, source_line: str):
+    def apply_record_trigger(self, enabled: bool, source_line: str, _silent: bool = False):
         if self.backend is None:
             return
         self._trigger_source_line = source_line
         self.backend.configure_record_trigger(enabled, source_line)
-        self.status.emit(f"Record trigger: enabled={enabled}, source={source_line}")
+        if not _silent:
+            self.status.emit(f"Record trigger: enabled={enabled}, source={source_line}")
 
     def _read_trigger_level(self) -> Optional[int]:
         if self.backend is None:
@@ -1164,8 +1197,6 @@ class CameraWorker(QObject):
                 self._trigger_enabled = True
                 self._stop_by_trigger = True
             self._last_trigger_level = None
-        state = "enabled" if enabled else "disabled"
-        self.status.emit(f"Auto-start mode {state}")
 
     def set_preview_target_fps(self, requested_fps: float):
         requested = max(1.0, float(requested_fps))
@@ -1273,7 +1304,12 @@ class CameraWorker(QObject):
 
             trigger_level = None
             if trigger_enabled and (armed or recording or auto_start):
-                trigger_level = self._read_trigger_level()
+                now_t = time.time()
+                if (now_t - self._last_trigger_poll_ts) >= self._trigger_poll_interval_s:
+                    trigger_level = self._read_trigger_level()
+                    self._last_trigger_poll_ts = now_t
+                else:
+                    trigger_level = self._last_trigger_level
 
             # Auto-start mode: whenever trigger is HIGH start a clip; when LOW stop current clip.
             if auto_start and trigger_enabled and (not recording) and trigger_level == 1:
@@ -1286,6 +1322,8 @@ class CameraWorker(QObject):
                 self._record_first_frame_ts = None
                 self._record_last_frame_ts = None
                 self._record_frame_count = 0
+                if self._shared_frame_counter is not None:
+                    self._shared_frame_counter.value = 0
                 self._record_writer_fps = None
                 self._record_queue_drops = 0
                 self._record_is_mono = False
@@ -1305,6 +1343,8 @@ class CameraWorker(QObject):
                 self._record_first_frame_ts = None
                 self._record_last_frame_ts = None
                 self._record_frame_count = 0
+                if self._shared_frame_counter is not None:
+                    self._shared_frame_counter.value = 0
                 self._record_writer_fps = None
                 self._record_queue_drops = 0
                 self._record_is_mono = False
@@ -1323,6 +1363,8 @@ class CameraWorker(QObject):
                 self._record_first_frame_ts = None
                 self._record_last_frame_ts = None
                 self._record_frame_count = 0
+                if self._shared_frame_counter is not None:
+                    self._shared_frame_counter.value = 0
                 self._record_writer_fps = None
                 self._record_queue_drops = 0
                 self._record_is_mono = False
@@ -1416,6 +1458,8 @@ class CameraWorker(QObject):
                     if not accepted:
                         self._record_queue_drops += 1
                     self._record_frame_count += 1
+                    if self._shared_frame_counter is not None:
+                        self._shared_frame_counter.value = self._record_frame_count
                     if self._record_first_frame_ts is None:
                         self._record_first_frame_ts = packet.ts_s
                     self._record_last_frame_ts = packet.ts_s
@@ -1535,9 +1579,14 @@ class PreviewLabel(QLabel):
 
 
 class CameraGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, module_mode: bool = False, hub_mode: bool = False):
         super().__init__()
-        self.setWindowTitle("HKrobot Camera GUI")
+        self._module_mode = module_mode
+        self._hub_mode = hub_mode
+        self._module_log_lines: list = []
+        self._module_save_folder: str = os.getcwd()
+        self._module_base_name: str = "camera_run"
+        self.setWindowTitle("Camera Module" if module_mode else "HKrobot Camera GUI")
         self.resize(1000, 600)
 
         self.worker = CameraWorker()
@@ -1551,6 +1600,7 @@ class CameraGUI(QMainWindow):
         self._record_flash_timer = QTimer(self)
         self._record_flash_timer.setInterval(320)
         self._record_flash_timer.timeout.connect(self._toggle_record_indicator)
+        self._shared_frame_counter = None
 
         self._init_ui()
         self._bind_signals()
@@ -1560,6 +1610,11 @@ class CameraGUI(QMainWindow):
         self.worker_thread.started.connect(self.worker.run)
         self.worker_thread.start()
         QTimer.singleShot(250, self._auto_connect_on_startup)
+
+    def set_shared_frame_counter(self, counter) -> None:
+        """Set a multiprocessing.Value shared with the master process."""
+        self._shared_frame_counter = counter
+        self.worker._shared_frame_counter = counter
 
     def _auto_connect_on_startup(self):
         if self._connected:
@@ -1618,7 +1673,7 @@ class CameraGUI(QMainWindow):
         self.exposure_spin = QDoubleSpinBox()
         self.exposure_spin.setRange(10.0, 200000.0)
         self.exposure_spin.setDecimals(1)
-        self.exposure_spin.setValue(25000.0)
+        self.exposure_spin.setValue(10000.0)
 
         self.fps_spin = QDoubleSpinBox()
         self.fps_spin.setRange(1.0, 500.0)
@@ -1628,7 +1683,7 @@ class CameraGUI(QMainWindow):
         self.gain_spin = QDoubleSpinBox()
         self.gain_spin.setRange(0.0, 30.0)
         self.gain_spin.setDecimals(2)
-        self.gain_spin.setValue(0.0)
+        self.gain_spin.setValue(10.0)
         self.gain_range_label = QLabel("Max: -- dB")
         gain_row = QHBoxLayout()
         gain_row.setContentsMargins(0, 0, 0, 0)
@@ -1717,11 +1772,11 @@ class CameraGUI(QMainWindow):
         self.sync_enable_check = QCheckBox("Enable sync/strobe")
         self.sync_enable_check.setChecked(True)
         self.sync_mode_combo = QComboBox()
-        self.sync_mode_combo.addItems(["Start of exposure", "Start of frame", "End of frame", "Exposure"])
-        self.sync_mode_combo.setCurrentText("Start of exposure")
+        self.sync_mode_combo.addItems(["Frame start active", "Start of frame", "Start of exposure", "End of frame", "Exposure"])
+        self.sync_mode_combo.setCurrentText("Frame start active")
         self.sync_output_line_combo = QComboBox()
         self.sync_output_line_combo.addItems(["Line1", "Line2", "Line3"])
-        self.sync_output_line_combo.setCurrentText("Line2")
+        self.sync_output_line_combo.setCurrentText("Line1")
         self.sync_pulse_us_spin = QDoubleSpinBox()
         self.sync_pulse_us_spin.setRange(1.0, 500000.0)
         self.sync_pulse_us_spin.setDecimals(1)
@@ -1760,6 +1815,45 @@ class CameraGUI(QMainWindow):
         self.left_tabs.addTab(save_tab, "Save")
         self.left_tabs.addTab(ni_tab, "I/O")
 
+        # In hub mode: merge all settings into a single "Settings" tab,
+        # hide save folder/name and trigger/sync (controlled by master),
+        # and hide the log area.
+        if self._hub_mode:
+            # Remove the three default tabs
+            while self.left_tabs.count():
+                self.left_tabs.removeTab(0)
+
+            # Build one merged tab
+            merged_tab = QWidget()
+            merged_form = QFormLayout(merged_tab)
+            merged_form.addRow("Exposure (us)", self.exposure_spin)
+            merged_form.addRow("Frame rate (Hz)", self.fps_spin)
+            merged_form.addRow("Gain", gain_wrap)
+            merged_form.addRow("Resolution", self.resolution_combo)
+            merged_form.addRow("ROI", roi_wrap)
+            merged_form.addRow("Grab strategy", self.grab_strategy_combo)
+            merged_form.addRow("ImageNodeNum", self.image_node_spin)
+            merged_form.addRow("OutputQueueSize", self.output_queue_spin)
+            merged_form.addRow("Format", self.codec_profile_combo)
+            merged_form.addRow("Buffer", queue_wrap)
+            merged_form.addRow("", self.drop_frames_check)
+            merged_form.addRow("Sync output line", self.sync_output_line_combo)
+            merged_form.addRow("Sync source", self.sync_mode_combo)
+            merged_form.addRow("Pulse width (us)", self.sync_pulse_us_spin)
+            self.sync_enable_check.setVisible(False)
+            self.left_tabs.addTab(merged_tab, "Settings")
+        elif self._module_mode:
+            # In module mode, hide save-path/name and trigger/sync settings
+            # (controlled by the master BehaviorHub GUI).
+            self.save_folder_edit.setVisible(False)
+            self.save_browse_btn.setVisible(False)
+            self.base_name_edit.setVisible(False)
+            self.trigger_enable_check.setVisible(False)
+            self.trigger_input_line_combo.setVisible(False)
+            self.auto_start_check.setVisible(False)
+            self.sync_enable_check.setVisible(False)
+            self.left_tabs.setTabVisible(self.left_tabs.indexOf(ni_tab), False)
+
         self.sw_buf_label = QLabel("Buffer: 0/0")
         self.fps_label = QLabel("Camera FPS: --")
         left_bottom_row = QHBoxLayout()
@@ -1788,7 +1882,10 @@ class CameraGUI(QMainWindow):
         self.status_box = QTextEdit()
         self.status_box.setReadOnly(True)
         self.status_box.setMinimumHeight(140)
-        layout.addWidget(self.status_box)
+        if self._hub_mode:
+            self.status_box.setVisible(False)
+        else:
+            layout.addWidget(self.status_box)
 
     def _bind_signals(self):
         self.refresh_btn.clicked.connect(self.on_refresh_cycle)
@@ -1830,18 +1927,18 @@ class CameraGUI(QMainWindow):
         self.preview_label.roi_cleared.connect(self.clear_roi)
 
     def _set_record_indicator_idle(self):
-        self.rec_indicator_btn.setStyleSheet(
-            "QPushButton {background:#3a3a3a; border:1px solid #565656; border-radius:9px;}"
-        )
+        self.rec_indicator_btn.hide()
+        self.rec_indicator_btn.setStyleSheet("")
 
     def _set_record_indicator_flash(self, on: bool):
+        self.rec_indicator_btn.show()
         if on:
             self.rec_indicator_btn.setStyleSheet(
                 "QPushButton {background:#d90429; border:1px solid #9e0220; border-radius:9px;}"
             )
         else:
             self.rec_indicator_btn.setStyleSheet(
-                "QPushButton {background:#5a5a5a; border:1px solid #787878; border-radius:9px;}"
+                "QPushButton {background:transparent; border:1px solid transparent; border-radius:9px;}"
             )
 
     def _toggle_record_indicator(self):
@@ -1893,6 +1990,8 @@ class CameraGUI(QMainWindow):
     def log(self, message: str):
         t = datetime.now().strftime("%H:%M:%S")
         self.status_box.append(f"[{t}] {message}")
+        if self._module_mode:
+            self._module_log_lines.append(message)
 
     def refresh_devices(self):
         self.device_combo.clear()
@@ -1917,7 +2016,7 @@ class CameraGUI(QMainWindow):
         w, h = text.split("x")
         return int(w), int(h)
 
-    def apply_trigger_settings(self, enable_override: Optional[bool] = None):
+    def apply_trigger_settings(self, enable_override: Optional[bool] = None, _silent: bool = False):
         if not self._connected:
             return
         try:
@@ -1925,6 +2024,7 @@ class CameraGUI(QMainWindow):
             self.worker.apply_record_trigger(
                 enabled=enabled,
                 source_line=self.trigger_input_line_combo.currentText().strip(),
+                _silent=_silent,
             )
         except Exception as exc:
             self.log(f"ERROR: Apply trigger settings failed: {exc}")
@@ -1939,16 +2039,18 @@ class CameraGUI(QMainWindow):
             self._set_acq_controls(False)
 
         if not self._connected:
-            self.log("Auto-start preference saved; connect camera to apply")
             return
 
         try:
             self.worker.set_auto_start_mode(bool(enabled), self._build_save_cfg())
-            self.apply_trigger_settings(enable_override=bool(enabled) or self.trigger_enable_check.isChecked())
+            self.apply_trigger_settings(
+                enable_override=bool(enabled) or self.trigger_enable_check.isChecked(),
+                _silent=True,
+            )
             if enabled:
                 self.worker.start_live()
                 self._set_live_controls(True)
-                self.log("Auto-start enabled: camera will record whenever trigger stays HIGH")
+                self.log("Auto-start enabled")
             else:
                 self.log("Auto-start disabled")
         except Exception as exc:
@@ -1965,7 +2067,9 @@ class CameraGUI(QMainWindow):
             self.apply_buffer_settings()
             # Keep free-run mode after connect so live FPS follows frame-rate settings.
             self.apply_trigger_settings(enable_override=False)
-            self.apply_sync_settings()
+            # In module mode, the master pushes sync profile; skip initial apply.
+            if not self._module_mode:
+                self.apply_sync_settings()
             self.worker.query_camera_limits()
             if self.auto_start_check.isChecked():
                 self.on_auto_start_toggled(True)
@@ -2143,6 +2247,7 @@ class CameraGUI(QMainWindow):
             return
         # Live should run in free-run mode unless acquisition explicitly arms trigger mode.
         self.apply_trigger_settings(enable_override=False)
+        self.apply_sync_settings()
         self.worker.start_live()
         self._set_live_controls(True)
         self.log("Live mode started")
@@ -2161,9 +2266,83 @@ class CameraGUI(QMainWindow):
         path = os.path.join(folder, f"{self.base_name_edit.text().strip()}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
         self.worker.snapshot(path)
 
+    def set_module_save_config(self, folder: str, base_name: str) -> None:
+        """Called by the master GUI to set save location in module mode."""
+        self._module_save_folder = folder
+        self._module_base_name = base_name
+        self.save_folder_edit.setText(folder)
+        self.base_name_edit.setText(base_name)
+
+    def set_module_auto_start(self, enabled: bool) -> None:
+        """Called by the master GUI to toggle auto-start in module mode."""
+        self.auto_start_check.blockSignals(True)
+        self.auto_start_check.setChecked(enabled)
+        self.auto_start_check.blockSignals(False)
+        self.on_auto_start_toggled(enabled)
+
+    def set_module_start_recording(self) -> None:
+        """Called by master to directly start recording (no trigger gating)."""
+        if not self._connected:
+            return
+        self.apply_sync_settings()
+        self.worker.arm_recording(
+            save_cfg=self._build_save_cfg(),
+            trigger_enabled=False,
+            stop_by_trigger=False,
+            auto_start=False,
+        )
+        self.worker.start_live()
+        self._set_acq_controls(True)
+        self._set_live_controls(True)
+        self.log("Recording started (master command)")
+
+    def set_module_stop_recording(self) -> None:
+        """Called by master to stop recording."""
+        if not self._connected:
+            return
+        self.worker.stop_recording(send_end_pulse=False)
+        self._set_acq_controls(False)
+        self.log("Recording stopped (master command)")
+
+    def set_module_sync_enabled(self, enabled: bool) -> None:
+        """Called by the master GUI to toggle sync/strobe output in module mode."""
+        self.sync_enable_check.blockSignals(True)
+        self.sync_enable_check.setChecked(bool(enabled))
+        self.sync_enable_check.blockSignals(False)
+        self.apply_sync_settings()
+
+    def set_module_sync_profile(self, output_line: str, source_mode: str, pulse_us: float) -> None:
+        """Called by the master GUI to push sync profile settings in module mode."""
+        line_text = (output_line or "Line1").strip() or "Line1"
+        mode_text = (source_mode or "Frame start active").strip() or "Frame start active"
+        pulse_val = float(max(1.0, pulse_us))
+
+        # Block signals to avoid duplicate apply_sync_settings calls.
+        for w in (self.sync_output_line_combo, self.sync_mode_combo, self.sync_pulse_us_spin):
+            w.blockSignals(True)
+
+        idx = self.sync_output_line_combo.findText(line_text)
+        if idx >= 0:
+            self.sync_output_line_combo.setCurrentIndex(idx)
+
+        mode_idx = self.sync_mode_combo.findText(mode_text)
+        if mode_idx >= 0:
+            self.sync_mode_combo.setCurrentIndex(mode_idx)
+
+        self.sync_pulse_us_spin.setValue(pulse_val)
+
+        for w in (self.sync_output_line_combo, self.sync_mode_combo, self.sync_pulse_us_spin):
+            w.blockSignals(False)
+
+        self.apply_sync_settings()
+
     def _build_save_cfg(self) -> SaveConfig:
-        folder = self.save_folder_edit.text().strip() or os.getcwd()
-        base = (self.base_name_edit.text().strip() or "camera_run") + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        if self._module_mode:
+            folder = self._module_save_folder or os.getcwd()
+            base = self._module_base_name or "camera_run"
+        else:
+            folder = self.save_folder_edit.text().strip() or os.getcwd()
+            base = self.base_name_edit.text().strip() or "camera_run"
         selected_ext, selected_fourcc_candidates = self.codec_profile_combo.currentData()
 
         return SaveConfig(
