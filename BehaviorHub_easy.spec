@@ -9,6 +9,7 @@ from PyInstaller.utils.hooks import copy_metadata
 
 BASE_DIR = os.path.abspath(globals().get("SPECPATH", os.getcwd()))
 SCRIPT_PATH = os.path.join(BASE_DIR, "BehaviorHub_GUI.py")
+ICON_PATH = os.path.join(BASE_DIR, "icon.ico")
 
 
 def _collect_files(src_dir, pattern, dest_dir, out_list):
@@ -99,6 +100,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ICON_PATH if os.path.isfile(ICON_PATH) else None,
 )
 
 coll = COLLECT(

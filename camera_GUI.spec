@@ -4,6 +4,10 @@ import glob
 import os
 
 
+BASE_DIR = os.path.abspath(globals().get("SPECPATH", os.getcwd()))
+ICON_PATH = os.path.join(BASE_DIR, "icon.ico")
+
+
 def _collect_files(src_dir, pattern, dest_dir, target_list):
     if not os.path.isdir(src_dir):
         return
@@ -58,4 +62,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ICON_PATH if os.path.isfile(ICON_PATH) else None,
 )
